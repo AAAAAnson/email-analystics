@@ -1,4 +1,5 @@
 import logging
+import re
 from typing import List, Dict, Any, Optional, AsyncGenerator
 from openai import AsyncOpenAI
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -15,39 +16,59 @@ class AIService:
     def __init__(self):
         self.client = AsyncOpenAI(
             api_key=settings.deepseek_api_key,
-            base_url=settings.deepseek_base_url
+            base_url=settings.deepseek_base_url,
+            timeout=60.0,  # 增加超时时间
+            max_retries=2
         )
         self.model = "deepseek-chat"
 
-    def _build_system_prompt(self, context_emails: List[tuple] = None) -> str:
+    def _build_system_prompt(self, context_emails: List[tuple] = None, has_emails: bool = False) -> str:
         """构建系统提示词"""
         base_prompt = """你是一个智能邮件助手，专门帮助用户管理和查询邮件内容。
 
-你的能力包括：
-1. 根据用户的问题，在邮件内容中查找相关信息
-2. 总结邮件内容、提取关键信息
-3. 回答关于邮件发件人、主题、时间等问题
-4. 帮助用户分析邮件中的待办事项、重要日期等
+【重要规则 - 必须严格遵守】
+1. 你只能基于下方提供的【邮件内容】来回答问题
+2. 绝对禁止编造、虚构任何邮件内容、发件人、主题或日期
+3. 如果下方没有提供邮件内容，或者提供的邮件与用户问题无关，必须回复："抱歉，我没有找到相关的邮件信息。请尝试用其他关键词描述您要查找的内容。"
+4. 引用邮件时必须准确标注：发件人、主题、日期
 
-回答原则：
-1. 只基于提供的邮件内容回答，不要编造信息
-2. 如果找不到相关信息，诚实告知用户
-3. 回答要简洁明了，突出重点
-4. 引用邮件时，标注来源（发件人、主题、日期）
 """
-        if context_emails:
-            base_prompt += "\n\n以下是与用户问题相关的邮件内容：\n"
+        if context_emails and len(context_emails) > 0:
+            base_prompt += f"\n以下是系统检索到的 {len(context_emails)} 封相关邮件：\n"
             base_prompt += "=" * 50 + "\n"
             for email_obj, similarity, chunk in context_emails:
-                base_prompt += f"\n【邮件】\n"
+                base_prompt += f"\n【邮件 ID:{email_obj.id}】\n"
                 base_prompt += f"发件人: {email_obj.sender}\n"
                 base_prompt += f"主题: {email_obj.subject}\n"
                 base_prompt += f"日期: {email_obj.date.strftime('%Y-%m-%d %H:%M') if email_obj.date else '未知'}\n"
-                base_prompt += f"相关内容: {chunk}\n"
+                base_prompt += f"内容摘要:\n{chunk}\n"
+                if email_obj.body_text and len(email_obj.body_text) > len(chunk):
+                    # 如果有更多内容，也提供
+                    full_content = email_obj.body_text[:1500]
+                    base_prompt += f"\n完整内容:\n{full_content}\n"
                 base_prompt += "-" * 30 + "\n"
             base_prompt += "=" * 50 + "\n"
+        else:
+            base_prompt += "\n【注意】系统未检索到相关邮件。请如实告知用户。\n"
 
         return base_prompt
+
+    def _is_latest_email_query(self, query: str) -> bool:
+        """判断是否是查询最新邮件"""
+        patterns = [
+            r'最新', r'最近', r'刚[收到|来]', r'今天', r'昨天',
+            r'newest', r'latest', r'recent', r'last'
+        ]
+        return any(re.search(p, query.lower()) for p in patterns)
+
+    async def _get_latest_emails(self, db: AsyncSession, limit: int = 5) -> List[Email]:
+        """获取最新的邮件"""
+        result = await db.execute(
+            select(Email)
+            .order_by(desc(Email.date))
+            .limit(limit)
+        )
+        return result.scalars().all()
 
     async def get_conversation_history(
         self,
@@ -63,8 +84,6 @@ class AIService:
             .limit(limit)
         )
         conversations = result.scalars().all()
-
-        # 按时间正序排列
         conversations = list(reversed(conversations))
 
         return [
@@ -99,18 +118,37 @@ class AIService:
     ) -> str:
         """与AI对话"""
         try:
-            # 搜索相关邮件
             context_emails = []
             related_email_ids = []
 
-            if use_rag:
+            # 判断是否查询最新邮件
+            if self._is_latest_email_query(user_message):
+                # 直接获取最新邮件
+                latest_emails = await self._get_latest_emails(db, limit=5)
+                context_emails = [
+                    (email, 1.0, email.body_text[:500] if email.body_text else "")
+                    for email in latest_emails
+                ]
+                related_email_ids = [e.id for e in latest_emails]
+            elif use_rag:
+                # 使用向量/关键词搜索
                 context_emails = await vector_service.search_similar(
                     db, user_message, top_k=5, threshold=0.3
                 )
                 related_email_ids = [e[0].id for e in context_emails]
 
+                # 如果没找到相关邮件，获取最新的几封作为参考
+                if not context_emails:
+                    latest_emails = await self._get_latest_emails(db, limit=3)
+                    if latest_emails:
+                        context_emails = [
+                            (email, 0.5, email.body_text[:500] if email.body_text else "")
+                            for email in latest_emails
+                        ]
+                        related_email_ids = [e.id for e in latest_emails]
+
             # 构建系统提示词
-            system_prompt = self._build_system_prompt(context_emails)
+            system_prompt = self._build_system_prompt(context_emails, has_emails=len(context_emails) > 0)
 
             # 获取对话历史
             history = await self.get_conversation_history(db, session_id)
@@ -124,7 +162,7 @@ class AIService:
             response = await self.client.chat.completions.create(
                 model=self.model,
                 messages=messages,
-                temperature=0.7,
+                temperature=0.3,  # 降低随机性，减少编造
                 max_tokens=2000
             )
 
@@ -149,18 +187,34 @@ class AIService:
     ) -> AsyncGenerator[str, None]:
         """流式对话"""
         try:
-            # 搜索相关邮件
             context_emails = []
             related_email_ids = []
 
-            if use_rag:
+            # 判断是否查询最新邮件
+            if self._is_latest_email_query(user_message):
+                latest_emails = await self._get_latest_emails(db, limit=5)
+                context_emails = [
+                    (email, 1.0, email.body_text[:500] if email.body_text else "")
+                    for email in latest_emails
+                ]
+                related_email_ids = [e.id for e in latest_emails]
+            elif use_rag:
                 context_emails = await vector_service.search_similar(
                     db, user_message, top_k=5, threshold=0.3
                 )
                 related_email_ids = [e[0].id for e in context_emails]
 
+                if not context_emails:
+                    latest_emails = await self._get_latest_emails(db, limit=3)
+                    if latest_emails:
+                        context_emails = [
+                            (email, 0.5, email.body_text[:500] if email.body_text else "")
+                            for email in latest_emails
+                        ]
+                        related_email_ids = [e.id for e in latest_emails]
+
             # 构建系统提示词
-            system_prompt = self._build_system_prompt(context_emails)
+            system_prompt = self._build_system_prompt(context_emails, has_emails=len(context_emails) > 0)
 
             # 获取对话历史
             history = await self.get_conversation_history(db, session_id)
@@ -174,7 +228,7 @@ class AIService:
             stream = await self.client.chat.completions.create(
                 model=self.model,
                 messages=messages,
-                temperature=0.7,
+                temperature=0.3,
                 max_tokens=2000,
                 stream=True
             )
@@ -239,10 +293,10 @@ class AIService:
             response = await self.client.chat.completions.create(
                 model=self.model,
                 messages=[
-                    {"role": "system", "content": "你是一个邮件助手，帮助用户总结和分析邮件。"},
+                    {"role": "system", "content": "你是一个邮件助手，帮助用户总结和分析邮件。只基于提供的信息回答，不要编造。"},
                     {"role": "user", "content": prompt}
                 ],
-                temperature=0.5,
+                temperature=0.3,
                 max_tokens=1500
             )
 
