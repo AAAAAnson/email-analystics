@@ -11,9 +11,10 @@ class Settings(BaseSettings):
     email_smtp_server: str = "smtp.163.com"
     email_smtp_port: int = 465
 
-    # DeepSeek配置
-    deepseek_api_key: str = ""
-    deepseek_base_url: str = "https://api.deepseek.com"
+    # Gemini API配置 (使用OpenAI兼容格式)
+    gemini_api_key: str = ""
+    gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai/"
+    gemini_model: str = "gemini-2.0-flash-exp"  # 或 gemini-1.5-flash, gemini-1.5-pro
 
     # 数据库配置
     database_url: str = "postgresql://emailbot:emailbot123@localhost:5432/emailbot"

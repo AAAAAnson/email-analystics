@@ -15,12 +15,12 @@ logger = logging.getLogger(__name__)
 class AIService:
     def __init__(self):
         self.client = AsyncOpenAI(
-            api_key=settings.deepseek_api_key,
-            base_url=settings.deepseek_base_url,
-            timeout=60.0,  # 增加超时时间
+            api_key=settings.gemini_api_key,
+            base_url=settings.gemini_base_url,
+            timeout=120.0,  # Gemini可能需要更长超时
             max_retries=2
         )
-        self.model = "deepseek-chat"
+        self.model = settings.gemini_model
 
     def _build_system_prompt(self, context_emails: List[tuple] = None, has_emails: bool = False) -> str:
         """构建系统提示词"""
