@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   # PostgreSQL + pgvector 向量数据库
   postgres:
