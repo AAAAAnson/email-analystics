@@ -25,7 +25,8 @@ class Settings(BaseSettings):
     backend_port: int = 9090
     websocket_port: int = 9092
 
-    # 向量化配置
+    # 向量化配置 (可选：配置硅基流动API实现语义搜索)
+    embedding_api_key: str = ""  # 硅基流动API Key，可在 https://siliconflow.cn 免费获取
     embedding_model: str = "BAAI/bge-large-zh-v1.5"
     embedding_dimension: int = 1024
     chunk_size: int = 500
